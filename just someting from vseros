@@ -1,0 +1,320 @@
+from transformers import ViTImageProcessor, ViTForImageClassification
+import torch
+import os
+import wandb
+from tqdm import tqdm
+import torch.nn as nn
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torchvision.transforms import v2
+from torcheval.metrics.functional import multiclass_f1_score
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+torch.cuda.empty_cache()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class VITdataset(Dataset):
+    def __init__(self, images_paths, images_names, images_indxes, trainable):
+        self.images_paths = images_paths
+        self.images_names = images_names
+        self.images_indxes = images_indxes
+        self.processor = ViTImageProcessor.from_pretrained('google/vit-base-patch16-224')
+        image_mean, image_std = self.processor.image_mean, self.processor.image_std
+        normalize = v2.Normalize(mean=image_mean, std=image_std)
+
+        if trainable == True:
+            self.transform = v2.Compose([
+                v2.Resize((self.processor.size["height"], self.processor.size["width"])),
+                v2.RandomHorizontalFlip(0.4),
+                v2.RandomVerticalFlip(0.1),
+                v2.RandomApply(transforms=[v2.RandomRotation(degrees=(0, 90))], p=0.5),
+                v2.RandomApply(transforms=[v2.ColorJitter(brightness=.3, hue=.1)], p=0.3),
+                v2.RandomApply(transforms=[v2.GaussianBlur(kernel_size=(5, 9))], p=0.3),
+                v2.ToTensor(),
+                normalize
+            ])
+        elif trainable == False:
+            self.transform = v2.Compose([
+                v2.Resize((self.processor.size["height"], self.processor.size["width"])),
+                v2.ToTensor(),
+                normalize
+            ])
+
+    def __getitem__(self, idx):
+        image = Image.open(os.path.join(self.images_paths, self.images_names[idx][0]))
+        image = self.transform(image)
+        return image, self.images_indxes[idx]
+
+    def __len__(self):
+        return len(self.images_indxes)
+
+
+
+class Head(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.linear1 = nn.Linear(input_dim, input_dim)
+        self.gelu1 = nn.GELU()
+
+        self.linear2 = nn.Linear(input_dim, output_dim)
+
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.gelu1(x)
+
+        x = self.linear2(x)
+
+        return x
+
+wandb.login(key = 'bb574f54db03f89674e1dba7770189c8f56e5a26')
+wandb.init(project='vit-image-classification')
+
+class VIT():
+    def __init__(self,):
+        self.model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224')
+        self.model.classifier = Head(self.model.classifier.in_features, 10)
+        self.model = self.model.to(device)
+
+    def train(self, dataset, validation,  epochs):
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-4)
+        #criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        criterion = nn.CrossEntropyLoss()
+        lambda_lr = lambda epoch: 0.4 ** epoch
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda_lr)
+        for epoch in range(epochs):
+            self.model.train()
+            for images, targets in tqdm(dataset, desc='Training', colour="cyan"):
+                images = images.to(device)
+                targets = targets.to(device)
+
+                optimizer.zero_grad()
+                model_output = self.model(images).logits
+                loss = criterion(model_output, targets)
+                loss.backward()
+                optimizer.step()
+
+                wandb.log({"loss": loss})
+            scheduler.step()
+
+            self.model.eval()
+            F1_sum = []
+            with torch.no_grad():
+                for images, targets in tqdm(validation, desc='Validation', colour="green"):
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    optimizer.zero_grad()
+                    model_output = self.model(images).logits
+                    pred_class = torch.argmax(model_output, dim=1)
+
+                    F1_metric = multiclass_f1_score(pred_class, targets, num_classes=10)
+                    F1_sum.append(F1_metric.item())
+
+            F1_sum = sum(F1_sum)/len(F1_sum)
+            wandb.log({"F1_metric": F1_sum})
+
+            wandb.log({"epoch": epoch + 1})
+
+        PATH = '/home/pret/PycharmProjects/pythonNetWork/NTO_image_classification/Models/Vit_5.pt'
+        torch.save(self.model.state_dict(), PATH)
+
+    def predict(self, path_to_images):
+        names = os.listdir(path_to_images)
+
+        processor = ViTImageProcessor.from_pretrained('google/vit-base-patch16-224')
+        image_mean, image_std = processor.image_mean, processor.image_std
+        normalize = v2.Normalize(mean=image_mean, std=image_std)
+
+        transform = v2.Compose([
+            v2.Resize((processor.size["height"], processor.size["width"])),
+            v2.ToTensor(),
+            normalize
+        ])
+        model_result = []
+        for name in tqdm(names, desc='Prediction', colour="red"):
+            image = Image.open(os.path.join(path_to_images, name))
+            image = transform(image)
+            image = torch.unsqueeze(image, 0)
+            image = image.to(device)
+            pred_class = torch.argmax(self.model(image).logits).item()
+            model_result.append(pred_class)
+
+        output = pd.DataFrame({
+            'image_name': names,
+            'predicted_class': model_result
+        })
+
+        output.to_csv('/home/pret/PycharmProjects/pythonNetWork/NTO_image_classification/Submission/submission.csv', index=False)
+
+path = '/home/pret/PycharmProjects/pythonNetWork/NTO_image_classification/Dataset/train'
+
+data_idx = pd.read_csv('/home/pret/PycharmProjects/pythonNetWork/NTO_image_classification/Dataset/train.csv')
+img_to_class = {row['image_name']: row['class_id'] for _, row in data_idx.iterrows()}
+class_to_name = {row['class_id']: row['unified_class'] for _, row in data_idx.iterrows()}
+images_names = data_idx['image_name'].values
+imagest_target = [img_to_class[name] for name in images_names]
+X_train, X_test, y_train, y_test = train_test_split(images_names.reshape(-1,1), imagest_target, test_size=0.2, stratify=imagest_target, random_state=42)
+
+
+train = VITdataset(path, X_train, y_train, trainable = True)
+val = VITdataset(path, X_test, y_test, trainable = False)
+
+train = DataLoader(train, batch_size=32, shuffle=True)
+val = DataLoader(val, batch_size=16, shuffle=False)
+
+epochs = 5
+
+Vit = VIT()
+Vit.train(train, val, epochs)
+
+pred_path = '/home/pret/PycharmProjects/pythonNetWork/NTO_image_classification/Dataset/test'
+Vit.predict(pred_path)
+
+
+
+
+
+You are an expert mentor for the International Olympiad in Artificial Intelligence (IOAI). Your role is to help me thoroughly solve complex AI and machine learning problems by:
+
+Analyzing Problems Deeply:
+
+Clearly understanding the problem statement, identifying key objectives, constraints, and success metrics.
+
+Looking at the problem from multiple perspectives and suggesting innovative approaches, ensuring the solution adheres strictly to the provided constraints.
+
+
+Providing Strategic Suggestions and Improvements:
+Critically evaluating my ideas, offering constructive feedback and improvements.
+
+Proposing alternative or enhanced solutions when necessary, with a clear explanation of why your approach is preferable.
+
+
+Best Practices in ML Competitions:
+Applying advanced and practical ML competition techniques, such as cross-validation, model ensembling, hyperparameter tuning, feature engineering, and data augmentation.
+
+Clearly explaining your choice of methods and their appropriateness for the specific task.
+
+
+Writing High-Quality Code:
+Producing clean, efficient, and well-commented Python code tailored precisely to solve the given problem.
+
+Asking clarifying questions when specific details needed for coding are missing or unclear, ensuring accuracy and effectiveness.
+
+Debugging and optimizing provided code snippets, identifying and explaining issues clearly and constructively.
+
+
+Constructive Decision-Making:
+Engaging in thoughtful dialogue when differences of opinion arise, objectively determining the most effective solution rather than accepting suggestions without critical evaluation.
+
+
+Advanced and Task-Specific Visualization:
+Suggesting and implementing insightful and advanced visualization methods tailored specifically to the task at hand, beyond basic plots, to effectively interpret data, results, or model performance.
+
+Clearly justifying your choice of visualization methods and their relevance.
+
+
+Verification and Continuous Learning:
+Checking and verifying your responses and knowledge against reliable internet sources whenever necessary to ensure accuracy and reliability.
+
+
+Begin by clarifying the task with me, ensuring mutual understanding of all problem specifics, then proceed systematically through ideation, modeling, coding, debugging, evaluation, visualization, and improvement stages as required.
+
+
+
+
+
+
+
+
+
+
+
+
+Requirement already satisfied: transformers==4.45.2 in ./.venv/lib/python3.12/site-packages (4.45.2)
+Requirement already satisfied: sentence-transformers==3.1.1 in ./.venv/lib/python3.12/site-packages (3.1.1)
+Requirement already satisfied: filelock in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (3.16.1)
+Requirement already satisfied: huggingface-hub<1.0,>=0.23.2 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (0.25.2)
+Requirement already satisfied: numpy>=1.17 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (1.26.4)
+Requirement already satisfied: packaging>=20.0 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (24.1)
+Requirement already satisfied: pyyaml>=5.1 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (6.0.2)
+Requirement already satisfied: regex!=2019.12.17 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (2024.9.11)
+Requirement already satisfied: requests in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (2.32.3)
+Requirement already satisfied: safetensors>=0.4.1 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (0.4.5)
+Requirement already satisfied: tokenizers<0.21,>=0.20 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (0.20.1)
+Requirement already satisfied: tqdm>=4.27 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (4.66.5)
+Requirement already satisfied: torch>=1.11.0 in ./.venv/lib/python3.12/site-packages (from sentence-transformers==3.1.1) (2.5.1+cu121)
+Requirement already satisfied: scikit-learn in ./.venv/lib/python3.12/site-packages (from sentence-transformers==3.1.1) (1.5.2)
+Requirement already satisfied: scipy in ./.venv/lib/python3.12/site-packages (from sentence-transformers==3.1.1) (1.14.1)
+Requirement already satisfied: Pillow in ./.venv/lib/python3.12/site-packages (from sentence-transformers==3.1.1) (11.0.0)
+Requirement already satisfied: fsspec>=2023.5.0 in ./.venv/lib/pyt
+
+
+You are an expert mentor for the International Olympiad in Artificial Intelligence (IOAI). Your role is to help me thoroughly solve complex AI and machine learning problems by:
+
+Analyzing Problems Deeply:
+
+Clearly understanding the problem statement, identifying key objectives, constraints, and success metrics.
+
+Looking at the problem from multiple perspectives and suggesting innovative approaches, ensuring the solution adheres strictly to the provided constraints.
+
+
+Providing Strategic Suggestions and Improvements:
+Critically evaluating my ideas, offering constructive feedback and improvements.
+
+Proposing alternative or enhanced solutions when necessary, with a clear explanation of why your approach is preferable.
+
+
+Best Practices in ML Competitions:
+Applying advanced and practical ML competition techniques, such as cross-validation, model ensembling, hyperparameter tuning, feature engineering, data augmentation, and state-of-the-art methods including transformers, diffusion models, reinforcement learning, and other recent advanced techniques as appropriate.
+
+Clearly explaining your choice of methods and their appropriateness for the specific task.
+
+
+Writing High-Quality Code:
+Producing clean, efficient, and well-commented Python code tailored precisely to solve the given problem.
+
+Asking clarifying questions when specific details needed for coding are missing or unclear, ensuring accuracy and effectiveness.
+
+Debugging and optimizing provided code snippets, identifying and explaining issues clearly and constructively.
+
+
+Constructive Decision-Making:
+Engaging in thoughtful dialogue when differences of opinion arise, objectively determining the most effective solution rather than accepting suggestions without critical evaluation.
+
+
+Advanced and Task-Specific Visualization:
+Suggesting and implementing insightful and advanced visualization methods tailored specifically to the task at hand, beyond basic plots, to effectively interpret data, results, or model performance.
+
+Clearly justifying your choice of visualization methods and their relevance.
+
+
+Verification and Continuous Learning:
+Checking and verifying your responses and knowledge against reliable internet sources whenever necessary to ensure accuracy and reliability.
+
+
+Begin by clarifying the task with me, ensuring mutual understanding of all problem specifics, then proceed systematically through ideation, modeling, coding, debugging, evaluation, visualization, and improvement stages as required.
+
+
+
+
+
+
+Requirement already satisfied: transformers==4.45.2 in ./.venv/lib/python3.12/site-packages (4.45.2)
+Requirement already satisfied: sentence-transformers==3.1.1 in ./.venv/lib/python3.12/site-packages (3.1.1)
+Requirement already satisfied: filelock in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (3.16.1)
+Requirement already satisfied: huggingface-hub<1.0,>=0.23.2 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (0.25.2)
+Requirement already satisfied: numpy>=1.17 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (1.26.4)
+Requirement already satisfied: packaging>=20.0 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (24.1)
+Requirement already satisfied: pyyaml>=5.1 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (6.0.2)
+Requirement already satisfied: regex!=2019.12.17 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (2024.9.11)
+Requirement already satisfied: requests in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (2.32.3)
+Requirement already satisfied: safetensors>=0.4.1 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (0.4.5)
+Requirement already satisfied: tokenizers<0.21,>=0.20 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (0.20.1)
+Requirement already satisfied: tqdm>=4.27 in ./.venv/lib/python3.12/site-packages (from transformers==4.45.2) (4.66.5)
+Requirement already satisfied: torch>=1.11.0 in ./.venv/lib/python3.12/site-packages (from sentence-transformers==3.1.1) (2.5.1+cu121)
+Requirement already satisfied: scikit-learn in ./.venv/lib/python3.12/site-packages (from sentence-transformers==3.1.1) (1.5.2)
+Requirement already satisfied: scipy in ./.venv/lib/python3.12/site-packages (from sentence-transformers==3.1.1) (1.14.1)
+Requirement already satisfied: Pillow in ./.venv/lib/python3.12/site-packages (from sentence-transformers==3.1.1) (11.0.0)
+Requirement already satisfied: fsspec>=2023.5.0 in ./.venv/lib/pyt
