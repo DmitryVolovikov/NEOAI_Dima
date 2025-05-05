@@ -1,0 +1,87 @@
+```python
+# Negative-LR Adversarial Training to Erase "Elephant" Concept on mini-diffusers
+# ------------------------------------------------------------------
+# Вместо SVD-стирания используем только adversarial fine-tuning с отрицательным lr:
+# "выталкиваем" концепт слона через градиентный подъём.
+# 1. Загружаем модель и датасет слонов.
+# 2. Находим latent-представления и предсказываем шум по prompt "elephant".
+# 3. Вычисляем loss и делаем gradient ascent (lr < 0).
+# 4. Сохраняем изменённую модель.
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from diffusers import StableDiffusionPipeline
+from PIL import Image
+import os
+
+# Параметры
+model_id = "your-mini-diffusers-checkpoint"
+elephant_folder = "/path/to/elephant_images"
+batch_size = 4
+num_epochs = 3
+negative_lr = 1e-5  # положительное число, используем с отрицательным знаком в optimizer
+
+# 1. Загрузка модели
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
+pipe.unet.to(device).train()
+# Текстовый энкодер фиксируем, чтобы не искажать другие концепты
+pipe.text_encoder.to(device).eval()
+
+# 2. Датасет изображений слонов
+class ElephantDataset(Dataset):
+    def __init__(self, folder, transform=None):
+        self.paths = [os.path.join(folder, f) for f in os.listdir(folder)
+                      if f.lower().endswith(('png','jpg','jpeg'))]
+        self.transform = transform or transforms.Compose([
+            transforms.Resize((512,512)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5],[0.5])
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.paths[idx]).convert('RGB')
+        return self.transform(img)
+
+dataset = ElephantDataset(elephant_folder)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# 3. Adversarial fine-tuning: градиентный подъём (gradient ascent) по loss
+optimizer = torch.optim.Adam(pipe.unet.parameters(), lr=-negative_lr)
+criterion = torch.nn.MSELoss()
+
+for epoch in range(num_epochs):
+    running_loss = 0.0
+    for imgs in dataloader:
+        imgs = imgs.to(device)
+        # Инвертируем изображение в latent
+        latents = pipe.vae.encode(imgs * 2 - 1).latent_dist.sample() * 0.18215
+        # Шум и случайные timesteps
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(0, len(pipe.scheduler.timesteps), (latents.size(0),), device=device)
+        noisy_latents = pipe.scheduler.add_noise(latents, noise, timesteps)
+        # Получаем embeddings для "elephant"
+        input_ids = pipe.tokenizer(["elephant"] * imgs.size(0), return_tensors="pt", padding=True).input_ids.to(device)
+        text_embeds = pipe.text_encoder(input_ids)[0]
+        # Предсказываем шум
+        noise_pred = pipe.unet(noisy_latents, timesteps, encoder_hidden_states=text_embeds).sample
+        # MSE между предсказанным и реальным шумом
+        loss = criterion(noise_pred, noise)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    avg_loss = running_loss / len(dataloader)
+    print(f"Epoch {epoch+1}/{num_epochs}, Avg Loss: {avg_loss:.4f}")
+
+# 4. Сохранение модели с «стертым» концептом слона
+output_dir = "mini-diffusers-no-elephants-adv"
+pipe.save_pretrained(output_dir)
+print(f"Model saved to {output_dir}")
+```
